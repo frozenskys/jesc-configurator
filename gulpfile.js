@@ -269,8 +269,8 @@ gulp.task('debug', ['dist', 'clean-debug'], function (done) {
         platforms: platforms,
         flavor: 'sdk',
         macIcns: './images/icon_128.icns',
-        macPlist: { 'CFBundleDisplayName': 'JESC Configurator'}
-//        ,    winIco: './images/icon_128.ico',
+        macPlist: { 'CFBundleDisplayName': 'JESC Configurator'},
+        winIco: './images/icon_128.ico',
     });
     builder.on('log', console.log);
     builder.build(function (err) {
