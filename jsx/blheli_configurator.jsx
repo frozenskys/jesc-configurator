@@ -16,6 +16,7 @@ var Configurator = React.createClass({
             canFlashTlm: false,
             isFlashing: false,
             isLicensed: true,
+            isLocked: false,
             selectingFirmware: false,
             licensingAll: false,
             hasTelemetry: false,
@@ -34,6 +35,7 @@ var Configurator = React.createClass({
     componentWillMount: function() {
         this.updateVersionsMetainfo();
         const interval = setInterval(this.updateVersionsMetainfo, METAINFO_UPDATE_INTERVAL_MS);
+
 
         this.setState({
             updateInterval: interval
@@ -93,6 +95,7 @@ var Configurator = React.createClass({
         const availableMetainfos = this.state.escMetainfo.filter(info => info.available);
         var isLicensed = true;
         var isActivated = true;
+        var isLocked = false;
         var isJesc = true;
         var hasTelemetry = true;
         for (var i = 0; i < this.props.escCount; i++) {
@@ -102,6 +105,9 @@ var Configurator = React.createClass({
             if (!this.state.escMetainfo[i].isActivated) {
                 isActivated = false;
             }
+            if (this.state.escMetainfo[i].isLocked) {
+                isLocked = true;
+            }
             if (!this.state.escMetainfo[i].isJesc) {
                 isJesc = false;
             }
@@ -109,19 +115,26 @@ var Configurator = React.createClass({
                 hasTelemetry = false;
             }
         }
+            
         const canFlash = availableSettings.every(settings => settings.LAYOUT === availableSettings[0].LAYOUT);
         const canResetDefaults = availableSettings.every(settings => settings.LAYOUT_REVISION > BLHELI_S_MIN_LAYOUT_REVISION);
+        
         var noteStyle = "note";
         var noteText = "escFeaturesHelp";
-        if (this.props.escCount && !isLicensed) {
-            noteStyle = "info";
-            noteText = "escFeaturesHelpUnlicensed";
-        } else if (isLicensed && !hasTelemetry) {
+        if (isLocked) {
             noteStyle = "alert";
-            if (!isActivated) {
-                noteText = "escWarnJESC";
-            } else {
-                noteText = "escWarnTelemetry";
+            noteText = "escWarnLocked";
+        } else {
+            if (this.props.escCount && !isLicensed) {
+                noteStyle = "info";
+                noteText = "escFeaturesHelpUnlicensed";
+            } else if (isLicensed && !hasTelemetry) {
+                noteStyle = "alert";
+                if (!isActivated) {
+                    noteText = "escWarnJESC";
+                } else {
+                    noteText = "escWarnTelemetry";
+                }
             }
         }
 
@@ -134,6 +147,7 @@ var Configurator = React.createClass({
             hasTelemetry: hasTelemetry,
             isLicensed: availableSettings.length == 0 || isLicensed,
             isActivated: isActivated,
+            isLocked: isLocked,
             noteStyle: noteStyle,
             noteText: noteText
         });
@@ -179,6 +193,7 @@ var Configurator = React.createClass({
                 var isSiLabs = [ _4way_modes.SiLC2, _4way_modes.SiLBLB ].includes(interfaceMode),
                     settingsArray = null;
 
+                escMetainfo[esc].isLocked = false;
                 escMetainfo[esc].isActivated = false;
                 escMetainfo[esc].tlmVersion = undefined;
                 escMetainfo[esc].isJesc = false;
@@ -186,9 +201,13 @@ var Configurator = React.createClass({
                 if (isSiLabs) {
                     const data3 = (await _4way.read(0xb0, 0x4)).params;
                     escMetainfo[esc].isJesc = buf2ascii(data3.subarray(0,4)) == 'JESC';
-                    const data = (await _4way.read(0xfbfc, 3)).params;
+                    const data = (await _4way.read(0xfbfc, 4)).params;
                     if (data[0] != 0 && data[1] == 0xa5 && data[2] == 0xa5)
                         escMetainfo[esc].isActivated = true;
+                    if (data[3] != 255) {
+                        escMetainfo[esc].isLocked = true;
+                    }
+
                     const data2 = (await _4way.read(0x3e00, 5)).params;
                     escMetainfo[esc].tlmVersion = 0;
                     if (buf2ascii(data2.subarray(0,3)) == 'TLX') {
@@ -206,12 +225,48 @@ var Configurator = React.createClass({
                 } else {
                     settingsArray = (await _4way.readEEprom(0, BLHELI_LAYOUT_SIZE)).params;
                 }
-
+                var layoutChanged = false;
+                if (!escMetainfo[esc].isJesc) {
+                    var data = new Uint8Array(0x300);
+                    var pos = 0;
+                    for (var address = 0x250; address < 0x550; address += 0x80) {
+                        const d = (await _4way.read(address, 0x80)).params;
+                        data.set(d, pos);
+                        pos += 0x80;
+                    }
+                    var timing = 0;
+                    for (var i = 0; i < 0x300 - 5; i++) {
+                        if (data[i] == 0xf9 && data[i+1] == 0xc3 && data[i+2] == 0xe8 && data[i+3] == 0x94) {
+                            timing = data[i+4] / 2;
+                            break;
+                        }
+                    }
+                    if (timing) {
+                        var timingStr = String(timing);
+                        if (timingStr.length < 2)
+                            timingStr = "0" + timingStr;
+                        timingStr += "# ";
+                        for (var i = 0; i < timingStr.length; i++) {
+                            if (settingsArray[0x45 + i] != timingStr.charCodeAt(i)) {
+                                layoutChanged = true;
+                                settingsArray[0x45 + i] = timingStr.charCodeAt(i);
+                            }
+                        }
+                    }
+                    if (layoutChanged) {
+                        GUI.log("Detected nefarious timing: " + timing);
+                        escMetainfo[esc].settingsArray = settingsArray;
+                    }
+                }
+                    
+                
                 const settings = blheliSettingsObject(settingsArray);
-
+                
+                
                 escSettings[esc] = settings;
                 escMetainfo[esc].available = true;
 
+                googleAnalytics.sendEvent('ESC', 'LOCKED', escMetainfo[esc].isLocked);
                 googleAnalytics.sendEvent('ESC', 'VERSION', settings.MAIN_REVISION + '.' + settings.SUB_REVISION);
                 googleAnalytics.sendEvent('ESC', 'LAYOUT', settings.LAYOUT.replace(/#/g, ''));
                 googleAnalytics.sendEvent('ESC', 'MODE', blheliModeToString(settings.MODE));
@@ -410,7 +465,7 @@ var Configurator = React.createClass({
         // start the actual flashing process
         const initFlashResponse = await _4way.initFlash(escIndex);
         // select flashing algorithm given interface mode
-        await selectInterfaceAndFlash(initFlashResponse, escIndex, restart);
+        await selectInterfaceAndFlash(initFlashResponse, escMetainfo, escIndex, restart);
 
 
         await _4way.initFlash(escIndex);
@@ -458,12 +513,12 @@ var Configurator = React.createClass({
             notifyProgress(Math.min(Math.ceil(100 * status.bytes_processed / status.bytes_to_process), 100));
         }
 
-        function selectInterfaceAndFlash(message, escIndex, restart) {
+        function selectInterfaceAndFlash(message, escMetainfo, escIndex, restart) {
             var interfaceMode = message.params[3]
             escMetainfo.interfaceMode = interfaceMode
 
             switch (interfaceMode) {
-            case _4way_modes.SiLBLB: return flashSiLabsBLB(message, escIndex, restart);
+            case _4way_modes.SiLBLB: return flashSiLabsBLB(message, escMetainfo, escIndex, restart);
                 case _4way_modes.AtmBLB:
                 case _4way_modes.AtmSK:  return flashAtmel(message);
                 default: throw new Error('Flashing with interface mode ' + interfaceMode + ' is not yet implemented');
@@ -478,14 +533,14 @@ var Configurator = React.createClass({
             MSP.send_message(MSP_codes.MSP_SET_4WAY_IF, false, false, function() { return deferred.resolve() });
         }
         
-        function flashSiLabsBLB(message, escIndex, restart) {
+        function flashSiLabsBLB(message, escMetainfo, escIndex, restart) {
             // @todo check device id
 
             
             // read current settings
             var promise = _4way.read(BLHELI_SILABS_EEPROM_OFFSET, BLHELI_LAYOUT_SIZE)
             // check MCU and LAYOUT
-            .then(checkESCAndMCU)
+            .then(checkESCAndMCU.bind(undefined, escMetainfo))
             // erase EEPROM page
             .then(erasePage.bind(undefined, 0x0D))
             // write **FLASH*FAILED** as ESC NAME
@@ -718,8 +773,11 @@ var Configurator = React.createClass({
 
         var escSettingArrayTmp;
 
-        function checkESCAndMCU(message) {
-            escSettingArrayTmp = message.params;
+        function checkESCAndMCU(escMetainfo, message) {
+            if (escMetainfo.hasOwnProperty('settingsArray'))
+                escSettingArrayTmp = escMetainfo.settingsArray;
+            else
+                escSettingArrayTmp = message.params;
             var isEncrypted = false;
             if (!isAtmel) {
                 const payload = buf2ascii(flashImage.subarray(0x1400, 0x1403));
@@ -1173,7 +1231,7 @@ var Configurator = React.createClass({
                     <div className="btn">
                         <a
                             href="#"
-                            className={!this.state.selectingFirmware && !this.state.isLicensed && this.props.escCount > 0 && !this.state.licensingAll ? "" : "disabled"}
+                            className={!this.state.selectingFirmware && !this.state.isLicensed && this.props.escCount > 0 && !this.state.licensingAll && !this.state.isLocked ? "" : "disabled"}
                             onClick={this.licenseAll}
                         >
                             {chrome.i18n.getMessage('escButtonLicenseAll')}
